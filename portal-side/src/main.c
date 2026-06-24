@@ -1,136 +1,193 @@
 /*
- * main.c — M1 portal-side bring-up + onboard status LED.
+ * main.c — v2 TUNNEL + write-safety, portal side (N16R8).
  *
- * Hosts a real Portal of Power and prints, over UART:
- *   - which figure (toy-ID) is placed/removed,
- *   - a full 1 KB dump of each newly-placed figure.
- * The onboard WS2812 mirrors the state (orange=no portal, blue=ready, green=figure).
+ * Transparent bridge: forwards every IN report to the console and every command
+ * to the real portal. On top it adds the figure-safety net:
+ *   - snoops the figure data as the console reads it (per slot, up to 16 tags —
+ *     so multiple figures, swapper halves and Trap Team traps are all covered);
+ *   - on the first WRITE to a figure, saves a pre-write backup to NVS (keyed by
+ *     the tag UID);
+ *   - acknowledges each WRITE so the console can retry on packet loss;
+ *   - BOOT button restores the backup of the figure currently on the portal.
  */
+#include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "driver/gpio.h"
+#include "nvs.h"
 
-#include "portal_host.h"
-#include "status_led.h"
-#include "sky_protocol.h"
+#include "tunnel_host.h"
 #include "esp_now_link.h"
 #include "link_protocol.h"
+#include "sky_protocol.h"
+#include "led.h"
 
 static const char *TAG = "main";
-static QueueHandle_t s_present_q;          /* slots of newly-placed figures */
-static volatile int  s_present_count;      /* figures currently on the portal */
-static uint16_t      s_toy[SKY_MAX_SLOTS]; /* toy-id per slot, 0 = absent */
+#define BTN_GPIO 0                         /* BOOT button = restore */
 
-/* Send the current presence (which slots + toy-ids) to the dongle. */
-static void send_presence(void) {
-    link_presence_t m;
-    link_hdr_init(&m.hdr, LINK_T_PRESENCE, 0);
-    m.present_mask = 0;
-    m.count = 0;
-    for (int i = 0; i < SKY_MAX_SLOTS; i++) {
-        if (s_toy[i]) {
-            m.present_mask |= (uint16_t)(1u << i);
-            m.figs[m.count].slot = i;
-            m.figs[m.count].toy_id = s_toy[i];
-            m.count++;
-        }
-    }
-    link_send(&m, sizeof(link_hdr_t) + 3 + m.count * sizeof(link_fig_t));
-}
+static volatile int64_t s_last_write_ms;   /* for the write-activity LED blink */
+static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
-/* Stream a figure's full 1 KB image to the dongle. */
-static void send_image(int slot, uint16_t toy, const uint8_t *dump) {
-    link_img_begin_t b;
-    link_hdr_init(&b.hdr, LINK_T_IMG_BEGIN, 0);
-    b.slot = slot; b.toy_id = toy; b.total_len = SKY_DUMP_SIZE;
-    b.crc16 = sky_crc16(dump, SKY_DUMP_SIZE);
-    link_send(&b, sizeof(b));
-
-    int chunks = link_img_num_chunks(SKY_DUMP_SIZE);
-    for (int c = 0; c < chunks; c++) {
-        link_img_chunk_t ch;
-        link_hdr_init(&ch.hdr, LINK_T_IMG_CHUNK, c);
-        ch.slot = slot;
-        ch.offset = c * LINK_CHUNK_DATA;
-        int nbytes = SKY_DUMP_SIZE - ch.offset;
-        if (nbytes > LINK_CHUNK_DATA) nbytes = LINK_CHUNK_DATA;
-        ch.len = nbytes;
-        memcpy(ch.data, dump + ch.offset, nbytes);
-        link_send(&ch, sizeof(link_hdr_t) + 4 + nbytes);
-        vTaskDelay(pdMS_TO_TICKS(8));      /* pace the radio */
-    }
-    link_img_end_t e;
-    link_hdr_init(&e.hdr, LINK_T_IMG_END, 0);
-    e.slot = slot;
-    link_send(&e, sizeof(e));
-}
-
-static void on_present(int slot, uint16_t toy_id) {
-    ESP_LOGI(TAG, "FIGURE placed  slot=%d  toyID=%u (0x%04X)", slot, toy_id, toy_id);
-    s_present_count++;
-    if (slot >= 0 && slot < SKY_MAX_SLOTS) s_toy[slot] = toy_id;
-    send_presence();
-    xQueueSend(s_present_q, &slot, 0);      /* dump_task will relay the image */
-}
-
-static void on_remove(int slot) {
-    ESP_LOGI(TAG, "FIGURE removed slot=%d", slot);
-    if (s_present_count > 0) s_present_count--;
-    if (slot >= 0 && slot < SKY_MAX_SLOTS) s_toy[slot] = 0;
-    send_presence();
-}
-
-static void hexdump_row(const char *label, const uint8_t *p) {
-    char line[64];
-    int n = 0;
-    for (int i = 0; i < SKY_BLOCK_SIZE; i++) n += sprintf(line + n, "%02X ", p[i]);
-    ESP_LOGI(TAG, "  %s: %s", label, line);
-}
-
-static void dump_task(void *arg) {
-    static uint8_t dump[SKY_DUMP_SIZE];
-    int slot;
-    for (;;) {
-        if (xQueueReceive(s_present_q, &slot, portMAX_DELAY) != pdTRUE) continue;
-        ESP_LOGI(TAG, "dumping slot %d…", slot);
-        int missing = portal_host_dump(slot, dump);
-        ESP_LOGI(TAG, "dump slot %d done (%d blocks missing), toyID=%u",
-                 slot, missing, sky_toy_id(dump));
-        hexdump_row("block0 (UID)", &dump[0]);
-        hexdump_row("block1 (id) ", &dump[SKY_BLOCK_SIZE]);
-        if (missing >= 0 && slot >= 0 && slot < SKY_MAX_SLOTS && s_toy[slot]) {
-            send_image(slot, s_toy[slot], dump);   /* relay to the dongle */
-            ESP_LOGI(TAG, "relayed slot %d image over ESP-NOW", slot);
-        }
-    }
-}
-
-/* Reflect portal state on the onboard LED. */
+/* LED: blinks white while writing, dim green when linked & ready, red otherwise. */
 static void led_task(void *arg) {
-    led_state_t last = -1;
-    int tick = 0;
+    led_init();
+    bool blink = false;
     for (;;) {
-        led_state_t st = (s_present_count > 0)      ? LED_FIGURE
-                       : portal_host_connected()    ? LED_PORTAL_READY
-                                                    : LED_WAITING;
-        if (st != last) { status_led_set(st); last = st; }
-        if (++tick >= 7) { tick = 0; send_presence(); }  /* ~1 s: heal lost packets */
-        vTaskDelay(pdMS_TO_TICKS(150));
+        if (now_ms() - s_last_write_ms < 300) {        /* recent write → blink */
+            blink = !blink;
+            led_set(blink ? 90 : 0, blink ? 90 : 0, blink ? 90 : 0);
+            vTaskDelay(pdMS_TO_TICKS(60));
+        } else {
+            if (link_is_linked() && tunnel_host_connected()) led_set(0, 30, 0);  /* ready */
+            else if (link_is_linked())                       led_set(0, 0, 40);  /* linked, no portal */
+            else                                             led_set(40, 0, 0);  /* no link */
+            vTaskDelay(pdMS_TO_TICKS(120));
+        }
+    }
+}
+
+static uint8_t  s_snoop[SKY_MAX_SLOTS][SKY_DUMP_SIZE];
+static bool     s_backed_up[SKY_MAX_SLOTS];
+static volatile uint16_t s_present_mask;
+
+static void uid_key(int slot, char *out) {  /* "bk_AABBCCDD" from block 0 */
+    const uint8_t *u = s_snoop[slot];
+    sprintf(out, "bk_%02X%02X%02X%02X", u[0], u[1], u[2], u[3]);
+}
+
+/* Pre-write backups run through a queue + task so the slow NVS commit NEVER
+ * stalls the write/ACK path. A stall there delayed the ACK → the console
+ * retried the write → the portal got hammered and the figure dropped off. */
+typedef struct { uint8_t img[SKY_DUMP_SIZE]; } bak_req_t;
+static QueueHandle_t s_bak_q;
+
+static void request_backup(int slot) {
+    if (!s_bak_q) return;
+    static bak_req_t tmp;                  /* only ever touched from the rx worker */
+    memcpy(tmp.img, s_snoop[slot], SKY_DUMP_SIZE);
+    xQueueSend(s_bak_q, &tmp, 0);          /* snapshot now, commit to flash later */
+}
+
+static void backup_task(void *arg) {
+    static bak_req_t req;
+    for (;;) {
+        if (xQueueReceive(s_bak_q, &req, portMAX_DELAY) != pdTRUE) continue;
+        nvs_handle_t h;
+        if (nvs_open("skybak", NVS_READWRITE, &h) != ESP_OK) continue;
+        char key[16];
+        const uint8_t *u = req.img;        /* UID = first 4 bytes of block 0 */
+        sprintf(key, "bk_%02X%02X%02X%02X", u[0], u[1], u[2], u[3]);
+        nvs_set_blob(h, key, req.img, SKY_DUMP_SIZE);
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGI(TAG, "pre-write backup saved (%s)", key);
+    }
+}
+
+/* Build a live copy of each figure from the reads the console performs. */
+static void snoop(const uint8_t *r, int len) {
+    if (r[0] == SKY_CMD_QUERY && r[1] != 0x01 && len >= 19) {
+        int slot = r[1] - 0x10, block = r[2];
+        if (slot >= 0 && slot < SKY_MAX_SLOTS && block < SKY_NUM_BLOCKS)
+            memcpy(s_snoop[slot] + block * SKY_BLOCK_SIZE, r + 3, SKY_BLOCK_SIZE);
+    } else if (r[0] == SKY_CMD_STATUS && len >= 6) {
+        uint32_t slots = r[1] | (r[2] << 8) | (r[3] << 16) | ((uint32_t)r[4] << 24);
+        uint16_t mask = 0;
+        for (int i = 0; i < SKY_MAX_SLOTS; i++) if ((slots >> (2 * i)) & 1) mask |= (uint16_t)(1u << i);
+        s_present_mask = mask;
+        for (int i = 0; i < SKY_MAX_SLOTS; i++)
+            if (!(mask & (1u << i))) s_backed_up[i] = false;   /* tag gone → allow a fresh backup */
+    }
+}
+
+/* portal -> console: forward + snoop */
+static void on_portal_in(const uint8_t *report, int len) {
+    snoop(report, len);
+    link_tunnel_t m;
+    link_hdr_init(&m.hdr, LINK_T_TUN_IN, 0);
+    m.len = (uint8_t)(len > (int)sizeof(m.data) ? (int)sizeof(m.data) : len);
+    memcpy(m.data, report, m.len);
+    link_send(&m, sizeof(link_hdr_t) + 1 + m.len);
+}
+
+/* console -> portal */
+static void on_link_recv(uint8_t type, const uint8_t *data, int len, int rssi) {
+    if (type == LINK_T_TUN_OUT) {
+        const link_tunnel_t *m = (const link_tunnel_t *)data;
+        tunnel_host_send(m->data, m->len);
+    } else if (type == LINK_T_TUN_OUTEP) {
+        const link_tunnel_t *m = (const link_tunnel_t *)data;
+        tunnel_host_send_out(m->data, m->len);   /* audio / trap-LED → OUT endpoint */
+    } else if (type == LINK_T_TUN_WRITE) {
+        const link_tunnel_t *m = (const link_tunnel_t *)data;
+        s_last_write_ms = now_ms();          /* drive the write-activity LED */
+        if (m->len >= 2) {
+            int slot = m->data[1] & 0x0F;        /* WRITE target slot */
+            if (slot < SKY_MAX_SLOTS && !s_backed_up[slot] && (s_present_mask & (1u << slot))) {
+                request_backup(slot);            /* async — does not stall the write */
+                s_backed_up[slot] = true;
+            }
+        }
+        tunnel_host_send(m->data, m->len);       /* deliver to the figure (sync) */
+        link_ack_t a;                            /* tell the console it arrived */
+        link_hdr_init(&a.hdr, LINK_T_ACK, 0);
+        a.ack_seq = m->hdr.seq;
+        a.status = LINK_OK;
+        link_send(&a, sizeof(a));
+    }
+}
+
+/* Restore the backup of the figure currently on the portal. */
+static void do_restore(void) {
+    int slot = -1;
+    for (int i = 0; i < SKY_MAX_SLOTS; i++) if (s_present_mask & (1u << i)) { slot = i; break; }
+    if (slot < 0) { ESP_LOGW(TAG, "restore: no figure on portal"); return; }
+
+    nvs_handle_t h;
+    if (nvs_open("skybak", NVS_READONLY, &h) != ESP_OK) { ESP_LOGW(TAG, "restore: no nvs"); return; }
+    char key[16];
+    uid_key(slot, key);
+    static uint8_t bak[SKY_DUMP_SIZE];
+    size_t sz = SKY_DUMP_SIZE;
+    esp_err_t e = nvs_get_blob(h, key, bak, &sz);
+    nvs_close(h);
+    if (e != ESP_OK) { ESP_LOGW(TAG, "restore: no backup for %s", key); return; }
+
+    ESP_LOGI(TAG, "restoring %s …", key);
+    for (int b = 1; b < SKY_NUM_BLOCKS; b++) {   /* skip block 0 (read-only UID) */
+        uint8_t cmd[SKY_REPORT_LEN];
+        sky_build_write(cmd, (uint8_t)slot, (uint8_t)b, bak + b * SKY_BLOCK_SIZE);
+        tunnel_host_send(cmd, 19);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ESP_LOGI(TAG, "restore done");
+}
+
+static void button_task(void *arg) {
+    gpio_config_t io = { .pin_bit_mask = 1ULL << BTN_GPIO, .mode = GPIO_MODE_INPUT, .pull_up_en = 1 };
+    gpio_config(&io);
+    bool prev = true;
+    for (;;) {
+        bool now = gpio_get_level(BTN_GPIO);
+        if (prev && !now) {                       /* press */
+            vTaskDelay(pdMS_TO_TICKS(50));
+            if (!gpio_get_level(BTN_GPIO)) do_restore();
+        }
+        prev = now;
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG, "Wireless Portal — portal side (M1)");
-    status_led_init();
-
-    s_present_q = xQueueCreate(8, sizeof(int));
-    xTaskCreate(dump_task, "dump", 4096, NULL, 4, NULL);
-    xTaskCreate(led_task, "led", 2560, NULL, 3, NULL);
-
-    portal_host_set_callbacks(on_present, on_remove);
-    ESP_ERROR_CHECK(portal_host_init());
-
-    link_init(LINK_ROLE_PORTAL, NULL);   /* M3: ESP-NOW link to the dongle */
+    ESP_LOGI(TAG, "Wireless Portal v2 (TUNNEL+safe) — portal side");
+    s_bak_q = xQueueCreate(4, sizeof(bak_req_t));
+    tunnel_host_init(on_portal_in);
+    link_init(LINK_ROLE_PORTAL, on_link_recv);
+    xTaskCreate(backup_task, "backup", 4096, NULL, 2, NULL);
+    xTaskCreate(button_task, "btn", 4096, NULL, 3, NULL);
+    xTaskCreate(led_task, "led", 3072, NULL, 3, NULL);
 }

@@ -5,6 +5,7 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -27,6 +28,13 @@ static uint8_t              s_peer[6];
 static volatile int64_t     s_last_rx_ms;
 static uint16_t             s_seq;
 
+/* Decouple the handler from the ESP-NOW RX callback: the callback runs in the
+ * WiFi task and MUST NOT block, but the portal-side handler does synchronous
+ * USB control transfers. So the callback only copies each frame into this queue
+ * and a worker task runs the (possibly blocking) handler. */
+typedef struct { int len; int rssi; uint8_t data[250]; } rx_item_t;
+static QueueHandle_t s_rx_q;
+
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
 static void add_peer(const uint8_t mac[6]) {
@@ -44,6 +52,8 @@ static void recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int le
     s_last_rx_ms = now_ms();
     if (info->rx_ctrl) s_rssi = info->rx_ctrl->rssi;
 
+    /* Link bookkeeping is fast & non-blocking → keep it here so link state and
+     * RSSI stay live even while the worker is busy doing USB I/O. */
     if (h->type == LINK_T_HELLO && len >= (int)sizeof(link_hello_t)) {
         const link_hello_t *hi = (const link_hello_t *)data;
         if (hi->role != s_role) {                       /* the other board */
@@ -56,7 +66,28 @@ static void recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int le
             }
         }
     }
-    if (s_handler) s_handler(h->type, data, len, s_rssi);
+
+    /* Hand everything else off to the worker task; never block in here. */
+    if (s_handler && s_rx_q && len <= (int)sizeof(((rx_item_t *)0)->data)) {
+        rx_item_t it;
+        it.len = len;
+        it.rssi = s_rssi;
+        memcpy(it.data, data, len);
+        if (xQueueSend(s_rx_q, &it, 0) != pdTRUE) {     /* full → drop oldest, keep order */
+            rx_item_t drop;
+            xQueueReceive(s_rx_q, &drop, 0);
+            xQueueSend(s_rx_q, &it, 0);
+        }
+    }
+}
+
+static void rx_task(void *arg) {
+    rx_item_t it;
+    for (;;) {
+        if (xQueueReceive(s_rx_q, &it, portMAX_DELAY) != pdTRUE) continue;
+        const link_hdr_t *h = (const link_hdr_t *)it.data;
+        if (s_handler) s_handler(h->type, it.data, it.len, it.rssi);
+    }
 }
 
 static void link_task(void *arg) {
@@ -95,6 +126,8 @@ void link_init(uint8_t role, link_recv_handler_t handler) {
     ESP_ERROR_CHECK(esp_wifi_set_channel(LINK_CHANNEL, WIFI_SECOND_CHAN_NONE));
 
     ESP_ERROR_CHECK(esp_now_init());
+    s_rx_q = xQueueCreate(32, sizeof(rx_item_t));
+    xTaskCreate(rx_task, "link_rx", 8192, NULL, 6, NULL);
     ESP_ERROR_CHECK(esp_now_register_recv_cb(recv_cb));
     add_peer(BROADCAST);
 

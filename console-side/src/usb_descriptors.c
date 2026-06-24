@@ -49,11 +49,11 @@ const tusb_desc_device_t portal_device_desc = {
 const uint8_t portal_config_desc[] = {
     /* config: 1 interface, value 1, no string, total len, attr, 100 mA */
     TUD_CONFIG_DESCRIPTOR(1, 1, 0, CONFIG_TOTAL_LEN, 0x00, 100),
-    /* HID in/out: itf 0, str 4, no boot protocol, report-desc len,
-     * out ep 0x01, in ep 0x81, 32-byte reports, 1 ms interval */
+    /* HID in/out matching a real Traptanium portal: out ep 0x02, in ep 0x81,
+     * 64-byte endpoints, 1 ms interval. (Reports themselves stay 32 bytes.) */
     TUD_HID_INOUT_DESCRIPTOR(0, 4, HID_ITF_PROTOCOL_NONE,
                              sizeof(portal_hid_report_desc),
-                             SKY_EP_OUT, SKY_EP_IN, SKY_REPORT_LEN, 1),
+                             0x02, 0x81, 64, 1),
 };
 
 const char *portal_string_desc[] = {

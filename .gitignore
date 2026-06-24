@@ -11,10 +11,10 @@ sdkconfig.old
 sdkconfig.*
 !sdkconfig.defaults
 
-# NOTE: managed_components/ is intentionally NOT ignored — it contains our
-# patched Espressif components (TinyUSB hid_device.c report_id tag,
-# usb_host_hid hid_host.c OUT-endpoint sender, led_strip include fix).
-# See README for the patch list.
+# managed_components/ is fetched by the IDF component manager and then patched at
+# build time by shared/patch_components.py, so it's regenerated — not committed.
+# (dependencies.lock IS committed, to pin the component versions.)
+managed_components/
 
 # ── Python (used by the dump/seed helper scripts, if any) ──
 __pycache__/
