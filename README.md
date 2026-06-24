@@ -4,6 +4,11 @@ Make a Skylanders Portal of Power **wireless**: place figures on a real portal i
 one place, play on a console (Wii / Wii U / PS3 / PS4) somewhere else. Two
 ESP32-S3 boards bridge the portal's USB over a 2.4 GHz ESP-NOW link.
 
+> ⚠️ **Console support:** Wii, Wii U, PS3 and PS4 — these all use the same wired
+> Portal of Power USB-HID protocol. **Xbox is NOT supported** — the Xbox 360 / One
+> Skylanders portals use a different, proprietary RF/USB scheme, so this emulation
+> will not work with them.
+
 ```
 [Figure] ─NFC→ [Real Portal of Power] ──USB──▶ [ESP32-S3-N16R8]
                                          (USB HOST)     │
@@ -162,6 +167,49 @@ pio run -e console-side-v2 -d v2-tunnel/console-side
 pio run -e portal-side  -d portal-side
 pio run -e console-side -d console-side
 ```
+
+### Wiring & the USB-OTG solder jumper
+
+> ⚠️ **You must bridge the N16R8's `USB-OTG` solder jumper with a blob of solder.**
+> The ESP32-S3-N16R8's native USB-C port ships wired as a USB *device*. The small
+> **`USB-OTG`** solder pad next to that connector must be **closed** to enable
+> host mode — otherwise the board cannot act as a USB host and the portal is
+> never detected.
+
+```
+  [ Figure ]
+      | NFC
+      v
+  +--------------------------------------+
+  | Real Portal of Power                 |
+  +------------------+-------------------+
+                     | USB data + 5 V VBUS   <-- external 5 V supply (GND common)
+                     v
+  +--------------------------------------+
+  | ESP32-S3-N16R8        (PORTAL SIDE)  |
+  |  - USB-C #1 (native) = USB HOST      |
+  |      /!\ OTG solder jumper BRIDGED   |
+  |  - USB-C #2 (CH343)  = power / logs  |
+  |      / serial / flashing             |
+  +------------------+-------------------+
+                     | ESP-NOW   (2.4 GHz, wireless)
+                     v
+  +--------------------------------------+
+  | T-Dongle-S3          (CONSOLE SIDE)  |
+  |  - USB-A = USB DEVICE (emul. portal) |
+  |  - ST7735 LCD = link/figure status   |
+  +------------------+-------------------+
+                     | USB
+                     v
+  +--------------------------------------+
+  | Console -- Wii / Wii U / PS3 / PS4   |
+  +--------------------------------------+
+```
+
+**Powering the portal:** the native OTG port does **not** source 5 V on its own.
+Feed **5 V to the portal's VBUS** from an external 5 V supply (or the N16R8's
+USB-C #2 rail), with **GND common** to the N16R8. The portal can draw ~500 mA
+with LEDs/RF, so don't undersize the supply.
 
 ### Flash — note: download mode is required
 Both boards run firmware that **takes over the native USB**, so you can't flash
