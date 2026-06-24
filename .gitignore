@@ -1,0 +1,29 @@
+# ── PlatformIO / ESP-IDF build output (large, regenerated on build) ──
+.pio/
+build/
+*.bin
+*.elf
+*.map
+
+# Generated sdkconfig (keep sdkconfig.defaults, which holds our settings)
+sdkconfig
+sdkconfig.old
+sdkconfig.*
+!sdkconfig.defaults
+
+# NOTE: managed_components/ is intentionally NOT ignored — it contains our
+# patched Espressif components (TinyUSB hid_device.c report_id tag,
+# usb_host_hid hid_host.c OUT-endpoint sender, led_strip include fix).
+# See README for the patch list.
+
+# ── Python (used by the dump/seed helper scripts, if any) ──
+__pycache__/
+*.pyc
+.venv/
+
+# ── IDE / OS junk ──
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
