@@ -20,7 +20,7 @@ ESP32-S3 boards bridge the portal's USB over a 2.4 GHz ESP-NOW link.
                   ST7735 shows link + figure status)
 ```
 
-## Locked design decisions
+## Design decisions
 
 | Topic | Decision |
 |-------|----------|
@@ -28,18 +28,26 @@ ESP32-S3 boards bridge the portal's USB over a 2.4 GHz ESP-NOW link.
 | Console-side | **T-Dongle-S3 emulates the portal** (TinyUSB device) |
 | Wireless link | **ESP-NOW** (connectionless, ~1–2 ms, symmetric peers, robust reconnect) |
 | Write handling | **Write the real figure, with a safety net** (see below) |
-| Sync model | **State replication, not raw tunneling** — T-Dongle answers the console locally from a cached figure image; only events/images/writes cross the radio |
+| Sync model | **Two variants** — v1 state-replication (cached image) or v2 transparent tunnel (full pass-through, incl. traps & sound). See [Two firmware variants](#two-firmware-variants). |
 
-## Why state replication (not USB tunneling)
+## Sync model: replication (v1) vs tunnel (v2)
 
 The console polls the portal and streams status; if every USB transaction had to
-round-trip over the radio, the console could time the portal out. Instead the
-T-Dongle keeps a **local cached copy** of each present figure (its 1 KB image)
-and answers Activate/Status/Query instantly. Only three things cross the link:
+round-trip over the radio, the console could time the portal out.
+
+**v1 (state replication)** sidesteps this: the T-Dongle keeps a **local cached
+copy** of each present figure (its 1 KB image) and answers Activate/Status/Query
+instantly. Only three things cross the link:
 
 1. **presence** (figure placed/removed + toy-ID) — tiny, frequent,
 2. **figure image** (1 KB, chunked) — once per placement,
 3. **write-back** (console → figure save data) — handled with the safety net.
+
+**v2 (transparent tunnel)** forwards every HID report instead, so traps, the
+portal speaker/LED effects and multiple figures all pass through. To stay within
+the console's timing it answers `Ready`/`Activate` locally for instant detection,
+keeps the audio stream off the command path (routing it to the portal's OUT
+endpoint), and ACKs + retries writes over the link.
 
 ## Figure-corruption protection (writes)
 
@@ -66,38 +74,12 @@ We write the **real** figure but never leave it in a bad state:
 > Query/Write commands and relays bytes. That keeps the firmware simpler and the
 > crypto out of scope.
 
-## Hardware notes / gotchas
-
-- **ESP32-S3 = BLE only, no classic BT.** We use ESP-NOW, so this is moot — but
-  don't expect SPP.
-- **One USB PHY per chip → one role per chip.** N16R8 native USB = **host**;
-  T-Dongle native USB (USB-A) = **device**. Good fit.
-- **USB host must power the portal (VBUS).** The portal draws up to ~500 mA with
-  LEDs/RF. Native USB ports on dev boards are device ports and usually don't
-  source 5 V. Plan to feed **5 V to the OTG port's VBUS** from the N16R8's second
-  (power) USB-C or an external 5 V supply, with common ground. This is the #1
-  hardware gotcha for USB-host on the S3.
-- **N16R8 second USB-C** = USB-UART bridge → power + flashing/serial logs.
-- **T-Dongle-S3 display** = 0.96" ST7735 (80×160), enough for a status screen;
-  has a TF slot (used for write backups / save files).
-
 ## Auto-reconnect & display
 
 ESP-NOW peers are symmetric: each board stores the peer MAC (paired once), and
 sends a periodic `HELLO`/`HEALTH` heartbeat. "Searching" = broadcasting discovery
 beacons until a peer answers; "linked" = heartbeats flowing. The T-Dongle screen
 shows: `SCANNING…` → `LINKED  rssi −xx` → `Figur: Spyro` → `WRITE…` etc.
-
-## Build milestones (firmware delivered per milestone, you flash & test)
-
-1. **M1 — N16R8 reads the real portal** over USB host (Activate/Status/Query →
-   identify + full dump), logs to serial. *Foundation; reuses our Python logic.*
-2. **M2 — T-Dongle emulates a portal** to the console (TinyUSB device; answers
-   Status/Query from a hard-coded image first). Validate on **Wii/PS3**.
-3. **M3 — ESP-NOW link**: presence + image replication; display status; pairing.
-4. **M4 — Write path** + the corruption-protection safety net.
-5. **M5 — Polish**: swappers/multi-figure, reconnect edge cases, optional
-   integration with the web tracker (pick figures, manage backups/dumps).
 
 ## Two firmware variants
 
@@ -152,7 +134,7 @@ firmwares implement.
     portal. (Not the N8/N8R8/single-port variants.)
   - A real **Portal of Power** (Trap Team / Traptanium recommended for full
     compatibility), USB cables, and a **5 V feed for the portal's VBUS** (see
-    *Hardware notes* above — the #1 gotcha).
+    *Wiring* below — the #1 gotcha).
 
 ### Build
 Run from the repo root (`source ~/.pio-venv/bin/activate` first, or prefix the
